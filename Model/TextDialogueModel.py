@@ -8,6 +8,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, Ta
 from typing import Dict
 import pdb
 import torch
+import argparse
 
 """
 トークナイズ
@@ -369,16 +370,18 @@ def inference(pretrained_path, peft_name):
                 print()
 
 
+parser = argparse.ArgumentParser(description="text dialogue model predict response and input's emotion label")
+
+parser.add_argument("--debug", default=True, help="True : using small debug data, False : using whole data. default=True")
+
+args = parser.parse_args()
+
 if __name__ == '__main__':
-    is_debug = False # If True use debug dataset 100 size, False use train, eval and test dataset
-    if is_debug:
-        save_path = "./Speech-to-TextDialogue/Speech-to-TextDialogueModel/ModelWeight/TextBaseModel"#_debug"
-        save_model_path = "./Speech-to-TextDialogue/Speech-to-TextDialogueModel/ModelWeight/TextBaseModel"#_debug"
-        pretrained_path = ""
-    else:
-        save_path = ""
-        save_model_path = ""
-        pretrained_path = ""
+    is_debug = args.debug # If True use debug dataset 100 size, False use train, eval and test dataset
+    
+    save_path = "./Speech-to-TextDialogue/Speech-to-TextDialogueModel/ModelWeight/TextBaseModel"
+    save_model_path = "./Speech-to-TextDialogue/Speech-to-TextDialogueModel/ModelWeight/TextBaseModel"
+    pretrained_path = "rinna/japanese-gpt-neox-3.6b-instruction-ppo"
 
     save_log_path = f"{save_path}/speech2text.log"
     train_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/dataset_train.json"

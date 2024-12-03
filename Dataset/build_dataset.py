@@ -154,6 +154,7 @@ def paraling_data(save_path):
 def main():
     # build dataset from STUDIES
     STUDIES(save_path="./STUDIES_data.json")
+    
     # build dataset from paraling_data
     paraling_data(save_path="./paraling_data.json")
 
