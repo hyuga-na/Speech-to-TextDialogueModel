@@ -1,5 +1,4 @@
 import os
-import tqdm
 import glob
 import librosa
 import torch
@@ -151,51 +150,12 @@ def paraling_data(save_path):
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(new_dataset, f, ensure_ascii=False, indent=2)
 
+
 def main():
+    # build dataset from STUDIES
     STUDIES(save_path="./STUDIES_data.json")
+    # build dataset from paraling_data
     paraling_data(save_path="./paraling_data.json")
-    exit()
-    dataset_path = "/mnt/home/hyuga-n/VOICE_DATA/STUDIES_voice_data"
-
-    #dataset_files = glob.glob(f"{dataset_path}/**/*[-][0-9][0-9].txt", recursive=True)
-    #
-    #for file in tqdm.tqdm(dataset_files):
-    #    if os.path.isfile(file):
-    #        os.remove(file)
-
-    dataset_files = glob.glob(f"{dataset_path}/**/*.txt", recursive=True)
-    #print(dataset_files)
-    
-    for file in tqdm.tqdm(dataset_files):
-        file_name = os.path.splitext(file)[0]
-
-        with open(file, "r") as f:
-            data = f.read().splitlines()
-        
-        for i in range(len(data)):
-            try:
-                prompt = data[i].split("|")[2]
-            except:
-                break
-
-            with open(f"{file_name}-{str(i+1).zfill(3)}.txt", "w") as f:
-                f.write(prompt)
-    
-    exit()
-    
-    for dir_path in dataset_files:
-        files = os.listdir(f"{dir_path}/txt")
-    
-        for file in tqdm.tqdm(files):
-            file_name = os.path.splitext(file)[0]
-
-            with open(file, "r") as f:
-                data = f.read().splitlines()
-            
-            for i in range(len(data)):
-                with open(f"{file}-{str(i).zfill(2)}", "w") as f:
-                    f.write(data[i].split("|")[2])     
-    
 
 if __name__ == "__main__":
     main()
