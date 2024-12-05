@@ -22,56 +22,88 @@ def data_split(prompts: List[str], split_ratio: List) -> Tuple[List[str]]:
 
 
 """データの分割
+引数
+    dataset_path : 分割するデータセットパス
+返却値
+    train_data, val_data, test_data : 分割後のデータ
 """
 import random
-def split_data():
-    dataset_path = "/mnt/home/hyuga-n/VOICE_DATA/nucc_studies_dataset.json"
+def split_data(dataset_path, split_ratio: List):
     json_open = open(dataset_path, "r")
     dataset_prompts = json.load(json_open)
     print(f"dataset_prompts:{len(dataset_prompts)}, {len(dataset_prompts[0])}")
 
     random.seed(0)
     random.shuffle(dataset_prompts)
-    train_path, val_path, test_path = data_split(dataset_prompts, [7,1,2]) # 訓練とテストデータ分割
-    print(f"train: {len(train_path)}, validation: {len(val_path)}, test: {len(test_path)}")
-
-    save_path = "/mnt/home/hyuga-n/VOICE_DATA/nucc_studies_dataset_train.json"
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(train_path, f, ensure_ascii=False, indent=2)
-
-    save_path = "/mnt/home/hyuga-n/VOICE_DATA/nucc_studies_dataset_val.json"
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(val_path, f, ensure_ascii=False, indent=2)
-
-    save_path = "/mnt/home/hyuga-n/VOICE_DATA/nucc_studies_dataset_test.json"
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(test_path, f, ensure_ascii=False, indent=2)
+    train_data, val_data, test_data = data_split(dataset_prompts, split_ratio) # 訓練とテストデータ分割
+    print(f"train: {len(train_data)}, validation: {len(val_data)}, test: {len(test_data)}")
+    
+    return train_data, val_data, test_data
 
 
-    dataset_path = "/mnt/home/hyuga-n/VOICE_DATA/wav2text_dataset.json"
-    json_open = open(dataset_path, "r")
+def split_paraling_data():
+    json_open = open("./Dataset/paraling_data.json", "r")
     dataset_prompts = json.load(json_open)
-    print(f"dataset_prompts:{len(dataset_prompts)}, {len(dataset_prompts[0])}")
 
-    random.seed(0)
-    random.shuffle(dataset_prompts)
-    train_path, val_path, test_path = data_split(dataset_prompts, [7,1,2]) # 訓練とテストデータ分割
-    print(f"train: {len(train_path)}, validation: {len(val_path)}, test: {len(test_path)}")
+    for i in range(len(dataset_prompts)):
+        dataset_prompts[i]["output_text"] = dataset_prompts[i]["output_text"][0]
 
-    save_path = "/mnt/home/hyuga-n/VOICE_DATA/wav2text_dataset_train.json"
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(train_path, f, ensure_ascii=False, indent=2)
+    eval_data = dataset_prompts[:100] # evaluate data for paralinguistic
 
-    save_path = "/mnt/home/hyuga-n/VOICE_DATA/wav2text_dataset_val.json"
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(val_path, f, ensure_ascii=False, indent=2)
+    train_data = [data for data in dataset_prompts[100:] if data["output_text"]]
+    
+    return train_data, eval_data
 
-    save_path = "/mnt/home/hyuga-n/VOICE_DATA/wav2text_dataset_test.json"
-    with open(save_path, "w", encoding="utf-8") as f:
-        json.dump(test_path, f, ensure_ascii=False, indent=2)
+"""paraling_dataの10発話全てに応答が付与されているものを確認
+"""
+def check():
+    json_open = open("./Dataset/paraling_data.json", "r")
+    dataset_prompts = json.load(json_open)
+
+    count = 0
+    num = 0
+    no = 0
+    for data in dataset_prompts:
+        prompt = data["output_text"][0]
+        count += 1
+        if bool(prompt):
+            no += 1
+            if no == 10:
+                print(data["no"])
+                no = 0
+                num += 1
+        else:
+            no = 0
+        
+        if count == 10:
+            count = 0
+            no = 0
+    
+    print("num=",num)
+
 
 def main():
-    split_data()
+    paraling_train, paraling_eval = split_paraling_data()
+
+    dataset_path = "./Dataset/STUDIES_data.json"
+    train, val, test = split_data(dataset_path, split_ratio=[7,1,2])
+
+    train += paraling_train
+    with open("./Dataset/train_data.json", "w", encoding="utf-8") as f:
+        json.dump(train, f, ensure_ascii=False, indent=2)
+    
+    with open("./Dataset/val_data.json", "w", encoding="utf-8") as f:
+        json.dump(val, f, ensure_ascii=False, indent=2)
+
+    with open("./Dataset/test_data.json", "w", encoding="utf-8") as f:
+        json.dump(test, f, ensure_ascii=False, indent=2)
+    
+    with open("./Dataset/evaluate_data.json", "w", encoding="utf-8") as f:
+        json.dump(paraling_eval, f, ensure_ascii=False, indent=2)
+    
+    with open("./Dataset/debug_data.json", "w", encoding="utf-8") as f:
+        json.dump(train[:100], f, ensure_ascii=False, indent=2)
 
 if __name__ == "__main__":
+    #check()
     main()
