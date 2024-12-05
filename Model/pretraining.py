@@ -9,130 +9,24 @@ from typing import Dict
 import pdb
 import torch
 import argparse
+import organize_data
+from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
 
-"""
-トークナイズ
-"""
-def tokenize(prompt: str, tokenizer, max_length=2048) -> Dict[str, ndarray]:
-    result = tokenizer(
-        prompt,
-        truncation=True,
-        max_length=max_length,
-        padding=False,
-    )
-    return {
-        "input_ids": torch.tensor(result["input_ids"]),
-        "attention_mask": torch.tensor(result["attention_mask"]),
-    }
 
+"""学習進歩を見るために学習中に推論を出力するためのCallback
 """
-モデルをint8_trainingにセット
-"""
-def set_model_for_kbit_training(model):
-    model = prepare_model_for_kbit_training(model)
-    return model
-
-"""
-set lora config
-"""
-def get_lora_config():
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=16,
-        target_modules=["query_key_value"],
-        lora_dropout=0.05,
-        bias="none",
-        task_type=TaskType.CAUSAL_LM
-    )
-    return lora_config
-
-"""
-LoRAセット
-"""
-def set_model_for_lora_training(model, lora_config):
-    model = set_model_for_kbit_training(model)
-    model = get_peft_model(model, lora_config)
-    return model
-
-"""
-print model size
-"""
-def print_model_size(model):
-    param_size = 0
-    for param in model.parameters():
-        param_size += param.nelement() * param.element_size()
-    buffer_size = 0
-    for buffer in model.buffers():
-        buffer_size += buffer.nelement() * buffer.element_size()
-
-    size_all_mb = (param_size + buffer_size) / 1024**2
-    print('model size: {:.3f}MB'.format(size_all_mb))
-
-"""
-get speech_i ids
-"""
-def get_wav_ids(features):
-    ids = ["speech_"+str(i) for i in features]
-    ids = "".join(ids)
-    return ids
-
-"""
-tuning pretrained llm to asr task
-"""
-def dialogue_lora(save_path, save_model_path, pretrained_path, save_log_path, train_path, val_path, test_path, debug_path, is_debug):
-    model = AutoModelForCausalLM.from_pretrained(
-        pretrained_path,
-        #load_in_8bit=True,
-        device_map="auto",
-        #device_map="sequential",
-    )
+class PredictionCallback(TrainerCallback):
+    def __init__(self, eval_dataset, tokenizer, log_step=[1,10,20,40,80,160,320,640,800]):
+        self.eval_dataset = eval_dataset
+        self.tokenizer = tokenizer
+        self.log_step = log_step
     
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_path, use_fast=False)
-
-    print(model)
-    model = set_model_for_lora_training(model, get_lora_config()) # set lora
-    print(model.print_trainable_parameters())
-    print_model_size(model)
-
-   
-
-    del data_path
-    torch.cuda.empty_cache()
-
-    from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
-    class PredictionCallback(TrainerCallback):
-        def __init__(self, eval_dataset, tokenizer, log_step=[1,10,20,40,80,160,320,640,800]):
-            self.eval_dataset = eval_dataset
-            self.tokenizer = tokenizer
-            self.log_step = log_step
+    def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
         
-        def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-            
-            if state.global_step in self.log_step:
-                model = kwargs["model"]
-
-                print(f"step: {state.global_step}")
-                for feature in self.eval_dataset[:10]:
-                    input_ids = feature["input_ids"].unsqueeze(0)
-
-                    with torch.no_grad():
-                        outputs = model.forward(
-                            input_ids=input_ids.to("cuda"),
-                            labels=input_ids.to("cuda")
-                        )
-                    
-                    answer = self.tokenizer.decode(feature["input_ids"])
-                    pred = self.tokenizer.decode(outputs["logits"].argmax(-1)[0])
-                    print("answer: ",answer)
-                    print("pred: ",pred)
-                    print("loss: ",outputs["loss"])
-                    print()
-        
-        def on_epoch_end(self, args: transformers.TrainingArguments, state: transformers.TrainerState, control: transformers.TrainerControl, **kwargs):
+        if state.global_step in self.log_step:
             model = kwargs["model"]
-            #pdb.set_trace()
 
-            print(f"epoch: {state.epoch}")
+            print(f"step: {state.global_step}")
             for feature in self.eval_dataset[:10]:
                 input_ids = feature["input_ids"].unsqueeze(0)
 
@@ -149,8 +43,109 @@ def dialogue_lora(save_path, save_model_path, pretrained_path, save_log_path, tr
                 print("loss: ",outputs["loss"])
                 print()
     
+    def on_epoch_end(self, args: transformers.TrainingArguments, state: transformers.TrainerState, control: transformers.TrainerControl, **kwargs):
+        model = kwargs["model"]
+        #pdb.set_trace()
+
+        print(f"epoch: {state.epoch}")
+        for feature in self.eval_dataset[:10]:
+            input_ids = feature["input_ids"].unsqueeze(0)
+
+            with torch.no_grad():
+                outputs = model.forward(
+                    input_ids=input_ids.to("cuda"),
+                    labels=input_ids.to("cuda")
+                )
+            
+            answer = self.tokenizer.decode(feature["input_ids"])
+            pred = self.tokenizer.decode(outputs["logits"].argmax(-1)[0])
+            print("answer: ",answer)
+            print("pred: ",pred)
+            print("loss: ",outputs["loss"])
+            print()
+            
+
+"""
+トークナイズ
+"""
+def tokenize(prompt: str, tokenizer, max_length=2048) -> Dict[str, ndarray]:
+    result = tokenizer(
+        prompt,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+    )
+    return {
+        "input_ids": torch.tensor(result["input_ids"]),
+        "attention_mask": torch.tensor(result["attention_mask"]),
+    }
+
+
+"""
+モデルをint8_trainingにセット
+"""
+def set_model_for_kbit_training(model):
+    model = prepare_model_for_kbit_training(model)
+    return model
+
+
+
+"""
+get speech_i ids
+"""
+def get_wav_ids(features):
+    ids = ["speech_"+str(i) for i in features]
+    ids = "".join(ids)
+    return ids
+
+"""LLMの事前学習
+引数
+    save_path : 学習結果を保存するパス
+    save_model_path : モデルパラメータを保存するパス
+    save_log_path : 学習ログを保存するパス
+    train_path : 学習データパス
+    val_path : 検証データパス
+    test_path : テストデータパス
+
+モデルの全てのパラメータを学習し, save_model_pathに保存する
+"""
+def pretraining_text(save_path, save_model_path, pretrained_path, save_log_path, train_path, val_path, test_path):
+    model = AutoModelForCausalLM.from_pretrained(
+        pretrained_path,
+        device_map="sequential",
+        )
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_path, use_fast=False)
+
+    print(model)
+    print(model.print_trainable_parameters())
+
+
+    """build dataset
+    List[ Dict{ 
+        "input_text": 入力テキスト,
+        "output_text": 応答テキスト,
+        "emotion": 感情
+        "input_ids": tokenize("<s>ユーザー: {入力テキスト}<NL>システム: {応答テキスト}</s>"),
+        "attention_mask": [1]*len(input_ids)
+        } ]
+    """
+    train_dataset = organize_data.pretrain_text(train_path)
+    val_dataset = organize_data.pretrain_text(val_path)
+    test_dataset = organize_data.pretrain_text(test_path)
+    print("train_dataset: ",len(train_dataset), end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in train_dataset]))
+    print("val_dataset: ",len(val_dataset), end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in val_dataset]))
+    print("test_dataset: ",len(test_dataset),end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in test_dataset]))
+    print("data size: ", sys.getsizeof(train_dataset))
+
+    
+ 
+    # 学習中の推論結果を見るためのCallback
     prediction_callback = PredictionCallback(eval_dataset=val_dataset[:10], tokenizer=tokenizer)
 
+    # learning config
     num_train_epochs = 3
     eval_steps = 1
     save_steps = 100
@@ -204,8 +199,12 @@ def dialogue_lora(save_path, save_model_path, pretrained_path, save_log_path, tr
     
     print("test_loss: ", pred_result["eval_loss"])
     
-"""
-generate sentence using trained model
+
+
+"""テキストモデルの推論
+引数
+    model_path : 推論するモデルのパラメータパス
+
 """
 import random
 def inference(pretrained_path, peft_name):
@@ -258,6 +257,7 @@ def inference(pretrained_path, peft_name):
                 print()
 
 
+
 parser = argparse.ArgumentParser(description="text dialogue model predict response and input's emotion label")
 
 parser.add_argument("--debug", default=True, help="True : using small debug data, False : using whole data. default=True")
@@ -280,7 +280,7 @@ if __name__ == '__main__':
         val_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/dataset_val.json"
         test_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/dataset_test.json"
 
-    dialogue_lora(
+    pretraining_text(
         save_path = save_path,
         save_model_path=save_model_path,
         pretrained_path=pretrained_path,
@@ -288,8 +288,6 @@ if __name__ == '__main__':
         train_path = train_path,
         val_path = val_path,
         test_path = test_path,
-        debug_path = debug_path,
-        is_debug = is_debug, 
     )
     inference(
         pretrained_path=save_model_path,

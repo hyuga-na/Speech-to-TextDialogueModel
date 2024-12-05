@@ -6,6 +6,7 @@ import pdb
 import json
 import pickle
 import nue_asr
+import tqdm
 
 """音響特徴量をクラスタリングするk-means
 """
@@ -150,6 +151,48 @@ def paraling_data(save_path):
     with open(save_path, "w", encoding="utf-8") as f:
         json.dump(new_dataset, f, ensure_ascii=False, indent=2)
 
+"""NUCCを感情考慮Speech-to-Text対話モデル用のデータ形式に変換
+引数
+    save_path : 構築したデータセットを保存するファイル名
+返却値
+    None
+
+List[Dict{
+    "input_text"
+    "output_text"
+    "input_wav"}]
+の形式で整形されたSTUDIESをsave_pathにjsonファイルとして保存
+"""
+def NUCC(save_path):
+    text_root_path = "/mnt/home/hyuga-n/VOICE_DATA/NUCC_voice_data/nucc/text"
+    wav_root_path = "/mnt/home/hyuga-n/VOICE_DATA/NUCC_voice_data/nucc/wav"
+
+    text_files = os.listdir(text_root_path)
+    wav_files = os.listdir(wav_root_path)
+
+    text_files.sort()
+    wav_files.sort()
+
+    datasets = []
+    for i in tqdm.tqdm(range(len(text_files)-1)):
+        with open(f"{text_root_path}/{text_files[i]}", "r") as f:
+            text = f.read()
+        
+        with open(f"{text_root_path}/{text_files[i+1]}", "r") as f:
+            responce = f.read()
+
+        audio, sr = librosa.load(f"{wav_root_path}/{wav_files[i]}", sr=None)
+        ids = speech2ids(audio)
+
+        datasets.append({
+            "input_text": text,
+            "output_text": responce,
+            "input_wav_ids": ids
+        })
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        json.dump(datasets, f, ensure_ascii=False, indent=2)
+
 
 def main():
     # build dataset from STUDIES
@@ -157,6 +200,9 @@ def main():
     
     # build dataset from paraling_data
     paraling_data(save_path="./paraling_data.json")
+
+    # build dataset from NUCC
+    NUCC(save_path="./Dataset/NUCC_data.json")
 
 if __name__ == "__main__":
     main()

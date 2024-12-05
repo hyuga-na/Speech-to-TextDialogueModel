@@ -94,7 +94,119 @@ def dialogue_lora(save_path, save_model_path, pretrained_path, save_log_path, tr
     print(model.print_trainable_parameters())
     print_model_size(model)
 
-   
+    """
+    build dataset
+    List[ Dict{ "input_ids": tokenize("<s>ユーザー: {音声トークン}[SEP]{書き起こしテキスト}<NL>システム: {応答テキスト}</s>"), "attention_mask": [1]*len(input_ids)} ]
+    """
+    if is_debug:
+        print("build debug dataset")
+        debug_dataset = []
+        data_path = open(debug_path, "r")
+        data_path = json.load(data_path)
+        for data in data_path:
+            # prompt
+
+            wav_text = get_wav_ids(data["input_wav_ids"])
+
+            # ids = Dict{"input_ids": torch.tensor(tokens), "attention_mask": torch.tensor([1]*len(tokens))}
+            ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+data["output_text"], tokenizer)
+
+            debug_dataset.append(
+                ids
+            )
+        # paraling-eval
+        data_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/eval_dataset.json"
+        dataset_paraling_eval = open(data_path, "r")
+        dataset_paraling_eval = json.load(dataset_paraling_eval)[:-1000]
+        for data in dataset_paraling_eval:
+            wav_text = get_wav_ids(data["input_wav_ids"])
+            if len(data["output_text"][0]) == 0:
+                response = "すみません、聞き取れませんでした。"
+            else:
+                response = data["output_text"][0]
+            ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+response, tokenizer)
+            debug_dataset.append(
+                ids
+            )
+        #pdb.set_trace()
+
+        train_dataset = debug_dataset
+        val_dataset = debug_dataset
+        test_dataset = debug_dataset
+    else:
+        train_dataset = []
+        data_path = open(train_path, "r")
+        data_path = json.load(data_path)
+        for data in data_path:
+            wav_text = get_wav_ids(data["input_wav_ids"])
+
+            input_ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+data["output_text"], tokenizer)["input_ids"]
+            
+            if len(input_ids) > 1000:
+                input_ids = input_ids[-1000:]
+            attention_mask = [1] * len(input_ids)
+            
+            train_dataset.append({
+                "input_text": data["input_text"],
+                "input_ids": torch.tensor(input_ids).to("cpu"),
+                "attention_mask": torch.tensor(attention_mask).to("cpu"),
+                })
+        # paraling-eval
+        data_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/eval_dataset.json"
+        dataset_paraling_eval = open(data_path, "r")
+        dataset_paraling_eval = json.load(dataset_paraling_eval)[:-1000]
+        for data in dataset_paraling_eval:
+            wav_text = get_wav_ids(data["input_wav_ids"])
+            if len(data["output_text"][0]) == 0:
+                response = "すみません、聞き取れませんでした。"
+            else:
+                response = data["output_text"][0]
+            ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+response, tokenizer)
+            train_dataset.append(
+                ids
+            )
+        
+        
+        val_dataset = []
+        data_path = open(val_path, "r")
+        data_path = json.load(data_path)
+        for data in data_path:
+            wav_text = get_wav_ids(data["input_wav_ids"])
+
+            input_ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+data["output_text"], tokenizer)["input_ids"]
+            if len(input_ids) > 1000:
+                input_ids = input_ids[-1000:]
+            attention_mask = [1] * len(input_ids)
+            
+            val_dataset.append({
+                "input_text": data["input_text"],
+                "input_ids": torch.tensor(input_ids).to("cpu"),
+                "attention_mask": torch.tensor(attention_mask).to("cpu"),
+                })
+
+        test_dataset = []
+        data_path = open(test_path, "r")
+        data_path = json.load(data_path)
+        for data in data_path:
+            wav_text = get_wav_ids(data["input_wav_ids"])
+
+            input_ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+data["output_text"], tokenizer)["input_ids"]
+            if len(input_ids) > 1000:
+                input_ids = input_ids[-1000:]
+            attention_mask = [1] * len(input_ids)
+            
+            test_dataset.append({
+                "input_text": data["input_text"],
+                "input_ids": torch.tensor(input_ids).to("cpu"),
+                "attention_mask": torch.tensor(attention_mask).to("cpu"),
+                })
+    print("train_dataset: ",len(train_dataset), end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in train_dataset]))
+    print("val_dataset: ",len(val_dataset), end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in val_dataset]))
+    print("test_dataset: ",len(test_dataset),end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in test_dataset]))
+    print("data size: ", sys.getsizeof(train_dataset))
 
     del data_path
     torch.cuda.empty_cache()
