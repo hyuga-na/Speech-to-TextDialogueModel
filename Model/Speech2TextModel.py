@@ -1,29 +1,244 @@
-import json
-from numpy import ndarray
+from transformers import AutoTokenizer, AutoModelForCausalLM, PretrainedConfig, PreTrainedModel
 import sys
-import torch
-import transformers
-from transformers import  AutoTokenizer, AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType, PeftModel
-from typing import Dict
-import pdb
-import torch
 import argparse
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType, PeftModel
+import torch
+import pdb
+
+import pretraining
+import organize_data
+import finetuning
+
+
+parser = argparse.ArgumentParser(description="text dialogue model predict response and input's emotion label")
+parser.add_argument("-d", "--debug", action="store_true", help="this is flag to use small debug data")
+args = parser.parse_args()
+
+
+def pretrain():
+    save_path = "./ModelWeight/Speech2TextModel"
+    save_log_path = "./Log/Speech2TextModelPretrain"
+    save_model_path = "./ModelWeight/Speech2TextModel"
+    pretrained_path = "rinna/japanese-gpt-neox-3.6b-instruction-ppo"
+    
+
+    # モデル定義
+    model = AutoModelForCausalLM.from_pretrained(
+        pretrained_path,
+        device_map="auto",
+        #load_in_8bit=True,
+        )
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_path, use_fast=False)
+    
+    # 音声トークンの拡張
+    tokenizer.add_tokens(list(["speech_"+str(i) for i in range(32000,33000)]))
+    model.resize_token_embeddings(len(tokenizer))
+
+    
+    if args.debug:
+        debug_path = "./Dataset/debug_data.json"
+        train_path = val_path = test_path = debug_path
+    else:
+        train_path = "./Dataset/pretrain_train_data.json"
+        val_path = "./Dataset/pretrain_val_data.json"
+        test_path = "./Dataset/pretrain_test_data.json"
+    
+
+    """build dataset
+    List[ Dict{ 
+        "input_text": 入力テキスト,
+        "output_text": 応答テキスト,
+        "emotion": 感情
+        "input_ids": tokenize("<s>ユーザー: {入力テキスト}<NL>システム: {応答テキスト}</s>"),
+        "attention_mask": [1]*len(input_ids)
+        } ]
+    """
+    train_dataset = organize_data.pretrain_wav(train_path, tokenizer=tokenizer)
+    val_dataset = organize_data.pretrain_wav(val_path, tokenizer=tokenizer)
+    test_dataset = organize_data.pretrain_wav(test_path, tokenizer=tokenizer)
+    print("train_dataset: ",len(train_dataset), end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in train_dataset]))
+    print("val_dataset: ",len(val_dataset), end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in val_dataset]))
+    print("test_dataset: ",len(test_dataset),end=", ")
+    print("max_input_ids_size: ",max([len(data["input_ids"]) for data in test_dataset]))
+    print("data size: ", sys.getsizeof(train_dataset))
+
+
+    pretraining.pretraining(model=model,
+                            tokenizer=tokenizer,
+                            save_path=save_path,
+                            save_model_path=save_model_path,
+                            save_log_path=save_log_path,
+                            train_dataset=train_dataset,
+                            val_dataset=val_dataset,
+                            test_dataset=test_dataset)
+
+
+def pretrain_inference():
+    pretrained_path = "./ModelWeight/Speech2TextModel"
+    dataset_path = "./Dataset/pretrain_test_data.json"
+
+    # モデル定義
+    model = AutoModelForCausalLM.from_pretrained(
+        pretrained_path,
+        device_map="auto",
+        )
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_path, use_fast=False)
+
+    dataset = organize_data.pretrain_text(dataset_path, tokenizer=tokenizer, inference=True)
+
+    pretraining.inference(model=model,
+                          tokenizer=tokenizer,
+                          dataset=dataset,
+                          ratio=0.1)
+
+
+
 
 """
-トークナイズ
+モデルconfig
 """
-def tokenize(prompt: str, tokenizer, max_length=2048) -> Dict[str, ndarray]:
-    result = tokenizer(
-        prompt,
-        truncation=True,
-        max_length=max_length,
-        padding=False,
-    )
-    return {
-        "input_ids": torch.tensor(result["input_ids"]),
-        "attention_mask": torch.tensor(result["attention_mask"]),
-    }
+class CustomConfig(PretrainedConfig):
+    model_type = "custom_model"
+    
+    def __init__(self, tokenizer_name="rinna/japanese-gpt-neox-3.6b-instruction-ppo", pretrained_path=None, **kwargs):
+        super().__init__(**kwargs)
+        self.pretrained_path = pretrained_path
+        self.tokenizer_name = tokenizer_name
+        self.custom_parameter = kwargs.get("custom_parameter", "default_value")
+
+
+class Speech2TextDialogueModel(PreTrainedModel):
+    config_class = CustomConfig
+    def __init__(self, config):
+        super().__init__(config)
+        self.llm = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path=config.pretrained_path,
+            device_map="auto",
+            output_hidden_states=True,
+            #load_in_8bit=True,
+            #torch_dtype=torch.float16
+        )
+        
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.pretrained_path,
+            use_fast=False
+        )
+
+        self.linear = torch.nn.Linear(self.llm.config.hidden_size, 5)
+        self.softmax = torch.nn.Softmax(dim=1)
+    
+
+    """応答と[CLS]から感情分類のlogitsを算出
+    引数
+        input_ids : 入力テキストトークン列
+        attention_mask : attention_mask
+        emotion: 正解感情
+    返却値
+        outputs = {
+            logits : LLMの生成logits
+            emotoin_logits : 感情分類のlogits
+            loss : 損失
+            その他正解データ
+            }
+    """
+    def forward(self, input_ids, attention_mask=None, emotion=None, labels=None, **kwargs):
+        
+        input_sequence = torch.cat((input_ids["input_ids"], input_ids["labels"]), dim=-1)
+        emotion = input_ids["emotion"]
+        attention_mask = input_ids["attention_mask"]
+        labels = input_sequence
+
+        # 応答生成
+        outputs = self.llm(
+            input_ids=input_sequence,
+            labels=labels,
+            attention_mask=attention_mask)
+        
+        # [CLS]トークンの場所を取得
+        if self.tokenizer.cls_token_id in input_sequence:
+            cls_index = torch.where(input_sequence == self.tokenizer.cls_token_id)
+        else:
+            cls_index = (0,-1)
+        
+        # [CLS]トークンの隠れ状態を合算
+        hidden_state = [tensor[cls_index] for tensor in outputs.hidden_states]
+        hidden_state = sum(hidden_state)/len(outputs.hidden_states)
+        
+        # 感情予測
+        emotion_logits = self.softmax(self.linear(hidden_state)).reshape(-1)
+        outputs["emotion_logits"] = emotion_logits
+        outputs["emotion"] = emotion
+        
+        # loss
+        dialogue_logits = outputs.logits
+        response_loss = torch.nn.CrossEntropyLoss()(dialogue_logits.view(-1, dialogue_logits.size(-1)), labels.view(-1))
+        
+        emotion_label = torch.tensor(outputs.emotion).to("cuda")
+        emotion_loss = torch.nn.CrossEntropyLoss()(emotion_logits.reshape(1,-1), emotion_label.reshape(-1))
+        
+        outputs["response_loss"] = response_loss
+        outputs["emotion_loss"] = emotion_loss
+
+        return outputs
+
+    """応答生成
+    入力
+        data = {
+            input_ids: 入力トークン列
+            input_text: 入力テキスト
+            output_text: 正解応答
+            emotion: 正解感情
+            }
+    出力
+        results = {
+            input_text: 入力テキスト
+            output_text: 正解応答テキスト
+            emotion: 正解感情
+            predict_response: 予測応答
+            predict_emotion: 予測感情
+        }
+    """
+    def generate(self, data):
+        outputs = self.llm.generate(
+            input_ids=data["input_ids"].unsqueeze(0).to("cuda"),
+            max_new_tokens=256,
+            min_new_tokens=2,
+            do_sample=True,
+            temperature=0.8,
+            repetition_penalty=1.2,
+            pad_token_id=self.tokenizer.pad_token_id,
+            bos_token_id=self.tokenizer.bos_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+        )
+        
+        
+        if self.tokenizer.cls_token_id in data["input_ids"].unsqueeze(0):
+            cls_index = torch.where(data["input_ids"].unsqueeze(0) == self.tokenizer.cls_token_id)
+            #pdb.set_trace()
+            hidden_state = [tensor[cls_index] for tensor in outputs["hidden_states"]]
+        else:
+            cls_index = torch.where(outputs["sequences"].unsqueeze(0) == self.tokenizer.cls_token_id)
+            # outputの0番目に[CLS]があるためhidden_statesの最後を取得する[0,-1,:]
+            hidden_state = [tensor[0,-1,:] for tensor in outputs["hidden_states"][0]]
+        
+        hidden_state = sum(hidden_state)
+        
+        emotion_logits = self.linear(hidden_state.to("cuda"))
+        
+        results = {
+            "input_text": data["input_text"],
+            "output_text": data["output_text"],
+            "emotion": data["emotion"],
+            "predict_response": self.tokenizer.decode(outputs["sequences"][0][data["input_ids"].size(-1):]),#.split("<NL>")[1],
+            "predict_emotion": emotion_logits.argmax(-1),
+        }
+        
+        return results
+
 
 """
 モデルをint8_trainingにセット
@@ -39,7 +254,7 @@ def get_lora_config():
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
-        target_modules=["query_key_value"],
+        target_modules=["query_key_value","linear"],
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM
@@ -68,138 +283,52 @@ def print_model_size(model):
     size_all_mb = (param_size + buffer_size) / 1024**2
     print('model size: {:.3f}MB'.format(size_all_mb))
 
-"""
-get speech_i ids
-"""
-def get_wav_ids(features):
-    ids = ["speech_"+str(i) for i in features]
-    ids = "".join(ids)
-    return ids
 
+
+"""モデルのファインチューニング
 """
-tuning pretrained llm to asr task
-"""
-def dialogue_lora(save_path, save_model_path, pretrained_path, save_log_path, train_path, val_path, test_path, debug_path, is_debug):
-    model = AutoModelForCausalLM.from_pretrained(
-        pretrained_path,
-        #load_in_8bit=True,
-        device_map="auto",
-        #device_map="sequential",
-    )
+def finetune(save_model_path):
+    save_path = save_model_path
+    save_log_path = "./Log/Speech2TextModelFinetune"
+    pretrained_path = "./ModelWeight/Speech2TextModel"
     
+
+    # モデル定義
+    config = CustomConfig(pretrained_path=pretrained_path, tokenizer_name=pretrained_path)
+    model = Speech2TextDialogueModel(config)
+
     tokenizer = AutoTokenizer.from_pretrained(pretrained_path, use_fast=False)
 
+
     print(model)
-    model = set_model_for_lora_training(model, get_lora_config()) # set lora
-    print(model.print_trainable_parameters())
+    model.llm = set_model_for_lora_training(model.llm, get_lora_config()) # set lora
+    model.linear.weight.requires_grad = False#True
+    model.linear.bias.requires_grad = False#True
+    print(model.llm.print_trainable_parameters())
     print_model_size(model)
 
-    """
-    build dataset
-    List[ Dict{ "input_ids": tokenize("<s>ユーザー: {音声トークン}[SEP]{書き起こしテキスト}<NL>システム: {応答テキスト}</s>"), "attention_mask": [1]*len(input_ids)} ]
-    """
-    if is_debug:
-        print("build debug dataset")
-        debug_dataset = []
-        data_path = open(debug_path, "r")
-        data_path = json.load(data_path)
-        for data in data_path:
-            # prompt
-
-            wav_text = get_wav_ids(data["input_wav_ids"])
-
-            # ids = Dict{"input_ids": torch.tensor(tokens), "attention_mask": torch.tensor([1]*len(tokens))}
-            ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+data["output_text"], tokenizer)
-
-            debug_dataset.append(
-                ids
-            )
-        # paraling-eval
-        data_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/eval_dataset.json"
-        dataset_paraling_eval = open(data_path, "r")
-        dataset_paraling_eval = json.load(dataset_paraling_eval)[:-1000]
-        for data in dataset_paraling_eval:
-            wav_text = get_wav_ids(data["input_wav_ids"])
-            if len(data["output_text"][0]) == 0:
-                response = "すみません、聞き取れませんでした。"
-            else:
-                response = data["output_text"][0]
-            ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+response, tokenizer)
-            debug_dataset.append(
-                ids
-            )
-        #pdb.set_trace()
-
-        train_dataset = debug_dataset
-        val_dataset = debug_dataset
-        test_dataset = debug_dataset
+    
+    if args.debug:
+        debug_path = "./Dataset/debug_data.json"
+        train_path = val_path = test_path = debug_path
     else:
-        train_dataset = []
-        data_path = open(train_path, "r")
-        data_path = json.load(data_path)
-        for data in data_path:
-            wav_text = get_wav_ids(data["input_wav_ids"])
+        train_path = "./Dataset/train_data.json"
+        val_path = "./Dataset/val_data.json"
+        test_path = "./Dataset/test_data.json"
+    
 
-            input_ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+data["output_text"], tokenizer)["input_ids"]
-            
-            if len(input_ids) > 1000:
-                input_ids = input_ids[-1000:]
-            attention_mask = [1] * len(input_ids)
-            
-            train_dataset.append({
-                "input_text": data["input_text"],
-                "input_ids": torch.tensor(input_ids).to("cpu"),
-                "attention_mask": torch.tensor(attention_mask).to("cpu"),
-                })
-        # paraling-eval
-        data_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/eval_dataset.json"
-        dataset_paraling_eval = open(data_path, "r")
-        dataset_paraling_eval = json.load(dataset_paraling_eval)[:-1000]
-        for data in dataset_paraling_eval:
-            wav_text = get_wav_ids(data["input_wav_ids"])
-            if len(data["output_text"][0]) == 0:
-                response = "すみません、聞き取れませんでした。"
-            else:
-                response = data["output_text"][0]
-            ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+response, tokenizer)
-            train_dataset.append(
-                ids
-            )
-        
-        
-        val_dataset = []
-        data_path = open(val_path, "r")
-        data_path = json.load(data_path)
-        for data in data_path:
-            wav_text = get_wav_ids(data["input_wav_ids"])
-
-            input_ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+data["output_text"], tokenizer)["input_ids"]
-            if len(input_ids) > 1000:
-                input_ids = input_ids[-1000:]
-            attention_mask = [1] * len(input_ids)
-            
-            val_dataset.append({
-                "input_text": data["input_text"],
-                "input_ids": torch.tensor(input_ids).to("cpu"),
-                "attention_mask": torch.tensor(attention_mask).to("cpu"),
-                })
-
-        test_dataset = []
-        data_path = open(test_path, "r")
-        data_path = json.load(data_path)
-        for data in data_path:
-            wav_text = get_wav_ids(data["input_wav_ids"])
-
-            input_ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"]+"<NL>システム: "+data["output_text"], tokenizer)["input_ids"]
-            if len(input_ids) > 1000:
-                input_ids = input_ids[-1000:]
-            attention_mask = [1] * len(input_ids)
-            
-            test_dataset.append({
-                "input_text": data["input_text"],
-                "input_ids": torch.tensor(input_ids).to("cpu"),
-                "attention_mask": torch.tensor(attention_mask).to("cpu"),
-                })
+    """build dataset
+    List[ Dict{ 
+        "input_text": 入力テキスト,
+        "output_text": 応答テキスト,
+        "emotion": 感情
+        "input_ids": tokenize("<s>ユーザー: {入力テキスト}<NL>システム: {応答テキスト}</s>"),
+        "attention_mask": [1]*len(input_ids)
+        } ]
+    """
+    train_dataset = organize_data.finetune_wav(train_path, tokenizer=tokenizer)
+    val_dataset = organize_data.finetune_wav(val_path, tokenizer=tokenizer)
+    test_dataset = organize_data.finetune_wav(test_path, tokenizer=tokenizer)
     print("train_dataset: ",len(train_dataset), end=", ")
     print("max_input_ids_size: ",max([len(data["input_ids"]) for data in train_dataset]))
     print("val_dataset: ",len(val_dataset), end=", ")
@@ -208,202 +337,53 @@ def dialogue_lora(save_path, save_model_path, pretrained_path, save_log_path, tr
     print("max_input_ids_size: ",max([len(data["input_ids"]) for data in test_dataset]))
     print("data size: ", sys.getsizeof(train_dataset))
 
-    del data_path
-    torch.cuda.empty_cache()
 
-    from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
-    class PredictionCallback(TrainerCallback):
-        def __init__(self, eval_dataset, tokenizer, log_step=[1,10,20,40,80,160,320,640,800]):
-            self.eval_dataset = eval_dataset
-            self.tokenizer = tokenizer
-            self.log_step = log_step
-        
-        def on_step_end(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-            
-            if state.global_step in self.log_step:
-                model = kwargs["model"]
-
-                print(f"step: {state.global_step}")
-                for feature in self.eval_dataset[:10]:
-                    input_ids = feature["input_ids"].unsqueeze(0)
-
-                    with torch.no_grad():
-                        outputs = model.forward(
-                            input_ids=input_ids.to("cuda"),
-                            labels=input_ids.to("cuda")
-                        )
-                    
-                    answer = self.tokenizer.decode(feature["input_ids"])
-                    pred = self.tokenizer.decode(outputs["logits"].argmax(-1)[0])
-                    print("answer: ",answer)
-                    print("pred: ",pred)
-                    print("loss: ",outputs["loss"])
-                    print()
-        
-        def on_epoch_end(self, args: transformers.TrainingArguments, state: transformers.TrainerState, control: transformers.TrainerControl, **kwargs):
-            model = kwargs["model"]
-            #pdb.set_trace()
-
-            print(f"epoch: {state.epoch}")
-            for feature in self.eval_dataset[:10]:
-                input_ids = feature["input_ids"].unsqueeze(0)
-
-                with torch.no_grad():
-                    outputs = model.forward(
-                        input_ids=input_ids.to("cuda"),
-                        labels=input_ids.to("cuda")
-                    )
-                
-                answer = self.tokenizer.decode(feature["input_ids"])
-                pred = self.tokenizer.decode(outputs["logits"].argmax(-1)[0])
-                print("answer: ",answer)
-                print("pred: ",pred)
-                print("loss: ",outputs["loss"])
-                print()
-    
-    prediction_callback = PredictionCallback(eval_dataset=val_dataset[:10], tokenizer=tokenizer)
-
-    num_train_epochs = 3
-    eval_steps = 1
-    save_steps = 100
-    logging_steps = 10
-    save_total_limit = 3
-    trainer = transformers.Trainer(
-        model=model,
-        train_dataset=train_dataset,
-        eval_dataset=val_dataset,
-        args=transformers.TrainingArguments(
-            num_train_epochs=num_train_epochs,
-            per_device_train_batch_size=1,
-            per_device_eval_batch_size=1,
-            gradient_accumulation_steps=32,
-            learning_rate=5e-5,
-            lr_scheduler_type="linear",
-            warmup_ratio=0.03,
-            logging_steps=logging_steps,
-            logging_dir=save_log_path,
-            evaluation_strategy="epoch",
-            save_strategy="epoch",
-            #eval_steps=eval_steps,
-            #save_steps=save_steps,
-            output_dir=save_path,
-            report_to="none",
-            save_total_limit=save_total_limit,
-            push_to_hub=False,
-            auto_find_batch_size=False,
-            load_best_model_at_end=True,
-            label_names=["labels"],
-            fp16=True,
-            dataloader_num_workers=4,
-        ),
-        data_collator=transformers.DataCollatorForLanguageModeling(
-            tokenizer, mlm=False
-        ),
-        callbacks=[prediction_callback]
-    )
-    
-    model.config.use_cache=False
-    trainer.train()
-    model.config.use_cache=True
-
-    # save model & tokenizer
-    trainer.save_state()
-    tokenizer.save_pretrained(save_model_path)
-    trainer.save_model(save_model_path)
-
-    model.eval()
-    pred_result = trainer.evaluate(test_dataset, ignore_keys=['loss', 'last_hidden_state', 'hidden_states', 'attentions'])
-    
-    print("test_loss: ", pred_result["eval_loss"])
-    
-"""
-generate sentence using trained model
-"""
-import random
-def inference(pretrained_path, peft_name):
-    print("inference")
-    
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_path, use_fast=False)
-        
-    model = AutoModelForCausalLM.from_pretrained(
-        pretrained_path,
-        device_map="sequential",
-        )
-    model = PeftModel.from_pretrained(
+    finetuning.finetune(
         model,
-        peft_name,
+        tokenizer,
+        save_path,
+        save_model_path,
+        save_log_path,
+        train_dataset,
+        val_dataset,
+        test_dataset
+        )
+
+
+"""ファインチューニングしたモデルの推論
+"""
+def finetune_inference(save_model_path):
+    pretrained_path = "./ModelWeight/Speech2TextModel"
+    peft_path = save_model_path
+    dataset_path = "./Dataset/train_data.json"
+
+    # モデル定義
+    config = CustomConfig(pretrained_path=pretrained_path, tokenizer_name=pretrained_path)
+    model = Speech2TextDialogueModel(config)
+    model.linear = torch.load(f"{peft_path}/linear.pth", map_location="cuda")
+    model.llm = PeftModel.from_pretrained(
+        model.llm,
+        peft_path,
         device_map="sequence"
     )
+
     print(model)
     model.eval()
 
-    random.seed(0)
+    tokenizer = AutoTokenizer.from_pretrained(pretrained_path, use_fast=False)
 
-    for data_type in ["debug","train", "val", "test"]:
-        print(f"build dataset for {data_type}")
-        path = f"/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/dataset_{data_type}.json"
-        
-        data_path = open(path, "r")
-        data_path = json.load(data_path)
-        
-        for data in data_path[:10]:
-            # prompt
-            wav_text = get_wav_ids(data["input_wav_ids"])
-            input_ids = tokenize("<s>ユーザー: "+wav_text+"[SEP]"+data["input_text"], tokenizer)["input_ids"]
-            input_ids = input_ids[:-1].unsqueeze(0) # cut </s>         
-            
-            if random.random() < 1:
-                with torch.no_grad():
-                    outputs = model.generate(
-                            input_ids.to("cuda"),
-                            max_new_tokens=256,
-                            min_new_tokens=2,
-                            do_sample=True,
-                            temperature=0.8,
-                            repetition_penalty=1.2,
-                            pad_token_id=tokenizer.pad_token_id,
-                            bos_token_id=tokenizer.bos_token_id,
-                            eos_token_id=tokenizer.eos_token_id,
-                        )
-                print("answer: ",data["input_text"]+"<NL>システム: "+data["output_text"])
-                print("pred: ",tokenizer.decode(outputs[0]).split("[SEP]")[1])
-                print()
+    dataset = organize_data.finetune_wav(dataset_path, tokenizer=tokenizer, inference=True)
 
-
-parser = argparse.ArgumentParser(description="text dialogue model predict response and input's emotion label")
-
-parser.add_argument("--debug", default=True, help="True : using small debug data, False : using whole data. default=True")
-
-args = parser.parse_args()
-
-if __name__ == '__main__':
-    is_debug = args.debug # If True use debug dataset 100 size, False use train, eval and test dataset
+    finetuning.inference(model=model,
+                          tokenizer=tokenizer,
+                          dataset=dataset,
+                          ratio=0.1)
     
-    save_path = "./Speech-to-TextDialogue/Speech-to-TextDialogueModel/ModelWeight/TextBaseModel"
-    save_model_path = "./Speech-to-TextDialogue/Speech-to-TextDialogueModel/ModelWeight/TextBaseModel"
-    pretrained_path = "rinna/japanese-gpt-neox-3.6b-instruction-ppo"
 
-    save_log_path = f"{save_path}/speech2text.log"
-    if is_debug:
-        debug_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/dataset_debug.json"
-        train_path = val_path = test_path = debug_path
-    else:
-        train_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/dataset_train.json"
-        val_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/dataset_val.json"
-        test_path = "/mnt/home/hyuga-n/E2ESpeechDialogue/S2Tdiscrete/dataset_test.json"
+if __name__=="__main__":
+    pretrain()
+    pretrain_inference()
 
-    dialogue_lora(
-        save_path = save_path,
-        save_model_path=save_model_path,
-        pretrained_path=pretrained_path,
-        save_log_path = save_log_path,
-        train_path = train_path,
-        val_path = val_path,
-        test_path = test_path,
-        debug_path = debug_path,
-        is_debug = is_debug, 
-    )
-    inference(
-        pretrained_path=save_model_path,
-        peft_name=save_model_path
-    )
+    save_model_path = "./ModelWeight/Speech2TextModelFT"
+    finetune(save_model_path)
+    finetune_inference(save_model_path)
