@@ -13,6 +13,7 @@ import organize_data
 from transformers import TrainerCallback, TrainingArguments, TrainerState, TrainerControl
 
 
+
 parser = argparse.ArgumentParser(description="text dialogue model predict response and input's emotion label")
 parser.add_argument("-d", "--debug", action="store_true", help="this is flag to use small debug data")
 args = parser.parse_args()
@@ -23,7 +24,8 @@ class MyTrainer(transformers.Trainer):
         
         labels = inputs["labels"]
         outputs = model.forward(inputs, labels)
-        alpha = self.state.global_step / self.state.max_steps
+        #alpha = self.state.global_step / self.state.max_steps
+        alpha = 0
         loss = outputs["response_loss"] + alpha * outputs["emotion_loss"]
         return (loss, outputs) if return_outputs else loss
 
@@ -43,28 +45,12 @@ class PredictionCallback(TrainerCallback):
 
             print(f"step: {state.global_step}")
             for feature in self.eval_dataset[:10]:
-                input_ids = feature["input_ids"].unsqueeze(0)
-                labels = feature["labels"].unsqueeze(0)
-                emotion = feature["emotion"]
-                attention_mask = feature["attention_mask"].unsqueeze(0)
-
+                with torch.no_grad():
+                    outputs = model.forward(feature)
+                print(f"response_loss: {outputs.response_loss}, emotion_loss: {outputs.emotion_loss}")
                 with torch.no_grad():
                     outputs = model.generate(feature)
-                    """outputs = model.forward(
-                        input_ids = input_ids.to("cuda"),
-                        labels = labels.to("cuda"),
-                        emotion = emotion,
-                        attention_mask = attention_mask.to("cuda")
-                    )"""
                 print(outputs)
-                #answer = self.tokenizer.decode(feature["input_ids"])
-                #pred = self.tokenizer.decode(outputs["logits"].argmax(-1)[0])
-                #print("answer_dialogue: ",answer)
-                #print("pred_dialogue: ",pred)
-                #print("answer_emotion: ",emotion)
-                #print("pred_emotion: ",outputs["emotion_logits"].argmax(-1))
-                #print("loss: ",outputs["loss"])
-                ##print("emotion_loss: ",outputs["emotion_loss"])
                 print()
     
     def on_epoch_end(self, args: transformers.TrainingArguments, state: transformers.TrainerState, control: transformers.TrainerControl, **kwargs):
@@ -73,27 +59,11 @@ class PredictionCallback(TrainerCallback):
 
         print(f"epoch: {state.epoch}")
         for feature in self.eval_dataset[:10]:
-            input_ids = feature["input_ids"].unsqueeze(0)
-            labels = feature["labels"].unsqueeze(0)
-            emotion = feature["emotion"]
-            attention_mask = feature["attention_mask"].unsqueeze(0)
-
+            with torch.no_grad():
+                outputs = model.forward(feature)
+            print(f"response_loss: {outputs.response_loss}, emotion_loss: {outputs.emotion_loss}")
             with torch.no_grad():
                 print(model.generate(feature))
-                #outputs = model.forward(
-                #    input_ids = input_ids.to("cuda"),
-                #    labels = labels.to("cuda"),
-                #    emotion = emotion,
-                #    attention_mask = attention_mask.to("cuda")
-                #)
-            
-            #answer = self.tokenizer.decode(feature["input_ids"])
-            #pred = self.tokenizer.decode(outputs["logits"].argmax(-1)[0])
-            #print("answer: ",answer)
-            #print("pred: ",pred)
-            #print("answer_emotion: ",emotion)
-            #print("pred_emotion: ",outputs["emotion_logits"].argmax(-1))
-            #print("loss: ",outputs["loss"])
             print()
             
 
@@ -103,7 +73,6 @@ class DataCollator():
         self.tokenizer = tokenizer
 
     def __call__(self, features):# features: List[Dict{"emotion", "input_ids", "labels", "attention_mask"}]
-        
         input_ids = [feature["input_ids"] for feature in features]
         labels = [feature["labels"] for feature in features]
         attention_mask = [feature["attention_mask"] for feature in features]
@@ -113,6 +82,7 @@ class DataCollator():
         input_ids = torch.nn.utils.rnn.pad_sequence(input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         labels = torch.nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=self.tokenizer.pad_token_id)
         attention_mask = torch.nn.utils.rnn.pad_sequence(attention_mask, batch_first=True, padding_value=0)
+        emotions = torch.nn.utils.rnn.pad_sequence(emotions, batch_first=True, padding_value=-1)
 
         
         return {
@@ -172,7 +142,7 @@ def finetune(model, tokenizer, save_path, save_model_path, save_log_path, train_
             push_to_hub=False,
             auto_find_batch_size=False,
             load_best_model_at_end=True,
-            label_names=["labels","emotion"],
+            label_names=["input_ids","attention_mask","labels","emotion"],
             fp16=True,
             dataloader_num_workers=16,
         ),
@@ -218,33 +188,3 @@ def inference(model, tokenizer, dataset, ratio=0.1):
                 outputs = model.generate(data)
             print(outputs)
             print()
-            continue
-            """outputs = model.llm.generate(
-                        input_ids=data["input_ids"].unsqueeze(0).to("cuda"),
-                        max_new_tokens=256,
-                        min_new_tokens=2,
-                        do_sample=True,
-                        temperature=0.8,
-                        repetition_penalty=1.2,
-                        pad_token_id=tokenizer.pad_token_id,
-                        bos_token_id=tokenizer.bos_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                        output_hidden_states=True,
-                        return_dict_in_generate=True,
-                    )
-                
-                cls_index = torch.where(outputs["sequences"] == model.tokenizer.cls_token_id)
-                #pdb.set_trace()
-                hidden_state = [tensor[cls_index] for tensor in outputs["hidden_states"][0]]
-                hidden_state = sum(hidden_state)
-                #hidden_state = outputs["hidden_states"][0][:][0][0]
-                
-                hidden_state = outputs["hidden_states"][0][-1][0][0] # (len(generated_sequences), attention_layers=37, batch_size, past_hidden_state)
-                emotion_logits = model.linear(hidden_state.to("cuda"))
-            
-            print("answer: ",data["input_text"]+"<NL>システム: "+data["output_text"])
-            print("pred: ",tokenizer.decode(outputs["sequences"][0]).split("<NL>")[1])
-            print("answer_emotion: ", data["emotion"])
-            print("pred_emotion: ",emotion_logits.argmax(-1))
-            #pdb.set_trace()
-            print()"""
