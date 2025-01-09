@@ -4,11 +4,14 @@ import argparse
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType, PeftModel
 import torch
 import pdb
+import os
 
 import pretraining
 import organize_data
 import finetuning
 
+# Reduce VRAM usage by reducing fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 parser = argparse.ArgumentParser(description="text dialogue model predict response and input's emotion label")
 parser.add_argument("-d", "--debug", action="store_true", help="this is flag to use small debug data")
@@ -26,13 +29,12 @@ def pretrain():
     model = AutoModelForCausalLM.from_pretrained(
         pretrained_path,
         device_map="auto",
-        #load_in_8bit=True,
         )
     tokenizer = AutoTokenizer.from_pretrained(pretrained_path, use_fast=False)
     
     # 音声トークンの拡張
     tokenizer.add_tokens(list(["speech_"+str(i) for i in range(32000,33000)]))
-    model.resize_token_embeddings(len(tokenizer))
+    model.resize_token_embeddings(len(tokenizer), mean_resizing=False)
 
     
     if args.debug:
@@ -117,8 +119,6 @@ class Speech2TextDialogueModel(PreTrainedModel):
             pretrained_model_name_or_path=config.pretrained_path,
             device_map="auto",
             output_hidden_states=True,
-            #load_in_8bit=True,
-            #torch_dtype=torch.float16
         )
         
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -134,52 +134,57 @@ class Speech2TextDialogueModel(PreTrainedModel):
     引数
         input_ids : 入力テキストトークン列
         attention_mask : attention_mask
-        emotion: 正解感情
+        emotion : 正解感情
+        labels : 正解応答テキスト
     返却値
         outputs = {
             logits : LLMの生成logits
             emotoin_logits : 感情分類のlogits
-            loss : 損失
+            response_loss : 応答生成損失
+            emotion_loss : 感情予測損失
             その他正解データ
             }
     """
     def forward(self, input_ids, attention_mask=None, emotion=None, labels=None, **kwargs):
         
-        input_sequence = torch.cat((input_ids["input_ids"], input_ids["labels"]), dim=-1)
+        input_sequence = torch.cat((input_ids["input_ids"], input_ids["labels"]), dim=-1).to("cuda")
         emotion = input_ids["emotion"]
-        attention_mask = input_ids["attention_mask"]
-        labels = input_sequence
-
+        attention_mask = torch.full(input_sequence.size(), fill_value=1)
+        # 入力部分は無視するために-100で埋める
+        labels = torch.cat((torch.full(input_ids["input_ids"].size(),fill_value=-100).to("cuda"), input_ids["labels"].to("cuda")), dim=-1)
+        
         # 応答生成
         outputs = self.llm(
-            input_ids=input_sequence,
-            labels=labels,
-            attention_mask=attention_mask)
-        
+            input_ids=input_sequence.reshape(1,-1),
+            labels=labels.reshape(1,-1),
+            attention_mask=attention_mask.reshape(1,-1))
+
         # [CLS]トークンの場所を取得
         if self.tokenizer.cls_token_id in input_sequence:
             cls_index = torch.where(input_sequence == self.tokenizer.cls_token_id)
         else:
             cls_index = (0,-1)
         
-        # [CLS]トークンの隠れ状態を合算
-        hidden_state = [tensor[cls_index] for tensor in outputs.hidden_states]
-        hidden_state = sum(hidden_state)/len(outputs.hidden_states)
-        
-        # 感情予測
-        emotion_logits = self.softmax(self.linear(hidden_state)).reshape(-1)
+        # [CLS]トークンの隠れ状態から感情を予測
+        hidden_states = outputs.hidden_states[-1]
+        emotion_logits = self.softmax(self.linear(hidden_states).squeeze())
+        emotion_logits = emotion_logits[cls_index[-1]]
         outputs["emotion_logits"] = emotion_logits
         outputs["emotion"] = emotion
         
         # loss
         dialogue_logits = outputs.logits
         response_loss = torch.nn.CrossEntropyLoss()(dialogue_logits.view(-1, dialogue_logits.size(-1)), labels.view(-1))
-        
         emotion_label = torch.tensor(outputs.emotion).to("cuda")
         emotion_loss = torch.nn.CrossEntropyLoss()(emotion_logits.reshape(1,-1), emotion_label.reshape(-1))
-        
         outputs["response_loss"] = response_loss
         outputs["emotion_loss"] = emotion_loss
+
+        # 学習中の応答と感情の予測結果を確認するためのもの
+        response = dialogue_logits.argmax(-1)[0, input_ids["input_ids"].size(-1):]
+        response = self.tokenizer.decode(response)
+        outputs["predict_response"] = response
+        outputs["predict_emotion"] = emotion_logits.argmax(-1)
 
         return outputs
 
@@ -214,20 +219,12 @@ class Speech2TextDialogueModel(PreTrainedModel):
             output_hidden_states=True,
             return_dict_in_generate=True,
         )
-        
-        
-        if self.tokenizer.cls_token_id in data["input_ids"].unsqueeze(0):
-            cls_index = torch.where(data["input_ids"].unsqueeze(0) == self.tokenizer.cls_token_id)
-            #pdb.set_trace()
-            hidden_state = [tensor[cls_index] for tensor in outputs["hidden_states"]]
-        else:
-            cls_index = torch.where(outputs["sequences"].unsqueeze(0) == self.tokenizer.cls_token_id)
-            # outputの0番目に[CLS]があるためhidden_statesの最後を取得する[0,-1,:]
-            hidden_state = [tensor[0,-1,:] for tensor in outputs["hidden_states"][0]]
-        
-        hidden_state = sum(hidden_state)
-        
-        emotion_logits = self.linear(hidden_state.to("cuda"))
+                
+        # [CLS]トークンの隠れ状態から感情を予測
+        hidden_states = outputs.hidden_states[-1]
+        emotion_logits = self.softmax(self.linear(hidden_states).squeeze())
+        emotion_logits = emotion_logits[0] # 0番目に[CLS]があるため
+        outputs["emotion_logits"] = emotion_logits
         
         results = {
             "input_text": data["input_text"],
@@ -254,7 +251,7 @@ def get_lora_config():
     lora_config = LoraConfig(
         r=8,
         lora_alpha=16,
-        target_modules=["query_key_value","linear"],
+        target_modules=["query_key_value"],
         lora_dropout=0.05,
         bias="none",
         task_type=TaskType.CAUSAL_LM
@@ -289,7 +286,7 @@ def print_model_size(model):
 """
 def finetune(save_model_path):
     save_path = save_model_path
-    save_log_path = "./Log/Speech2TextModelFinetune"
+    save_log_path = "./Log/Speech2TextModelFT"
     pretrained_path = "./ModelWeight/Speech2TextModel"
     
 
@@ -307,7 +304,6 @@ def finetune(save_model_path):
     print(model.llm.print_trainable_parameters())
     print_model_size(model)
 
-    
     if args.debug:
         debug_path = "./Dataset/debug_data.json"
         train_path = val_path = test_path = debug_path
@@ -360,12 +356,12 @@ def finetune_inference(save_model_path):
     # モデル定義
     config = CustomConfig(pretrained_path=pretrained_path, tokenizer_name=pretrained_path)
     model = Speech2TextDialogueModel(config)
-    model.linear = torch.load(f"{peft_path}/linear.pth", map_location="cuda")
     model.llm = PeftModel.from_pretrained(
         model.llm,
         peft_path,
         device_map="sequence"
     )
+    model.linear = torch.load(f"{peft_path}/linear.pth", map_location="cuda")
 
     print(model)
     model.eval()
@@ -381,9 +377,9 @@ def finetune_inference(save_model_path):
     
 
 if __name__=="__main__":
-    pretrain()
-    pretrain_inference()
+    #pretrain()
+    #pretrain_inference()
 
-    save_model_path = "./ModelWeight/Speech2TextModelFT"
+    save_model_path = "./ModelWeight/Speech2TextModelFT_0"
     finetune(save_model_path)
     finetune_inference(save_model_path)
